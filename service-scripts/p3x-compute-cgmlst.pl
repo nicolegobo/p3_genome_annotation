@@ -165,8 +165,33 @@ if ($dir_name) {
     );
     run_cmd(\@allele_call_cmd, "Allele Call");
 
-    # Join new allele call with master allele call using chewBBACA JoinProfiles
+    # check 95% of loci have an exact allele match
     my $new_allele_call = "$tmp_dir/new_genomes_allele_call/results_alleles.tsv";
+    if (!$opt->dry_run) {
+        open(my $check_fh, '<', $new_allele_call) or die "Cannot open $new_allele_call for validation: $!";
+        my $check_header = <$check_fh>;  # skip header
+        my $check_data = <$check_fh>;    # grab second line
+        close($check_fh);
+        chomp $check_data;
+        my @check_fields = split(/\t/, $check_data);
+        shift @check_fields;  # remove first column (filename)
+
+        my $total_loci = scalar @check_fields;
+        my $exact_matches = 0;
+        for my $val (@check_fields) {
+            $exact_matches++ if $val =~ /^\d+$/;
+        }
+
+        my $exact_pct = ($total_loci > 0) ? ($exact_matches / $total_loci) * 100 : 0;
+        print STDERR sprintf("Allele call check: %d / %d loci (%.1f%%) have exact allele matches\n",
+                             $exact_matches, $total_loci, $exact_pct);
+
+        if ($exact_pct < 95) {
+            die sprintf("Only %.1f%% of loci have exact allele matches (threshold: 95%%). Aborting.\n", $exact_pct);
+        }
+    }
+
+    # Join new allele call with master allele call using chewBBACA JoinProfiles
     my $master_table_dir = "/home/nbowers/bvbrc-dev/dev_container/cgmlst_for_all/rerunning_joins_11_25_2025/raw_genome_ids/";
     my $master_table = $master_table_dir . $dir_name . "_11_25_2025_joined.tsv";
     my $master_joined = "$tmp_dir/master_joined.tsv";
