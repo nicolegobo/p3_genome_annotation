@@ -17,7 +17,7 @@
     {
       "id": "scientific_name",
       "label": "Scientific Name",
-      "required": 1,
+      "required": 0,
       "default": null,
       "desc": "Scientific name of genome to be annotated",
       "type": "string"
@@ -83,6 +83,18 @@
       "label": "Don't index genome",
       "desc": "If set, don't index this genome in solr. It will not be available for analysis through the PATRIC site.",
       "type": "bool"
+    },
+    {
+      "id": "organism_mismatch_policy",
+      "required": 0,
+      "default": "auto",
+      "label": "If the organism prediction disagrees",
+      "desc": "What to do when the supplied taxonomy_id disagrees with the organism predicted from the contigs: 'auto' uses the predicted organism, 'supplied' keeps the supplied taxonomy_id.",
+      "type": "enum",
+      "enum": [
+        "auto",
+        "supplied"
+      ]
     },
     {
       "id": "skip_workspace_output",

@@ -1,0 +1,24 @@
+{
+  "code": "11",
+  "debug_level": 0,
+  "domain": "Bacteria",
+  "genome_size": 5000000,
+  "input_type": "reads",
+  "min_contig_cov": 5,
+  "min_contig_len": 300,
+  "output_file": "Escherichia coli SRR3584989 - read files",
+  "output_path": "/olson@patricbrc.org/PATRIC-QA/applications/App-ComprehensiveGenomeAnalysis",
+  "paired_end_libs": [
+    {
+      "read1": "/olson@patricbrc.org/PATRIC-QA/applications/App-ComprehensiveGenomeAnalysis/SRR3584989_1.fastq",
+      "read2": "/olson@patricbrc.org/PATRIC-QA/applications/App-ComprehensiveGenomeAnalysis/SRR3584989_2.fastq"
+    }
+  ],
+  "pilon_iter": 2,
+  "public": "0",
+  "queue_nowait": "0",
+  "racon_iter": 2,
+  "recipe": "auto",
+  "skip_indexing": "0",
+  "trim": "false"
+}

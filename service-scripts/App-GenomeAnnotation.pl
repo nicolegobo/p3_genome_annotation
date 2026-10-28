@@ -5,6 +5,7 @@
 
 use Bio::KBase::AppService::AppScript;
 use Bio::P3::GenomeAnnotationApp::GenomeAnnotationCore;
+use Bio::P3::GenomeAnnotationApp::SkaniPredictor;
 use Bio::KBase::AppService::AppConfig qw(data_api_url db_host db_user db_pass db_name seedtk);
 use Bio::KBase::AppService::FastaParser 'parse_fasta';
 use Bio::KBase::AppService::LongestCommonSubstring qw(BuildString BuildTree LongestCommonSubstring);
@@ -97,18 +98,244 @@ sub process_genome
 	$params->{taxonomy_id} = $raw_params->{tax_id};
     }
 
-    if ($params->{taxonomy_id} && $params->{taxonomy_id} !~ /^\s*(\d+)\s*$/)
-    {
-	die "Invalid taxonomy id (must be an integer)\n";
-    }
-    $params->{taxonomy_id} = $1;
-
+    #
+    # Validate any submitted taxonomy_id, but do NOT fail on a bad one.
+    #
+    # A non-integer value, or an integer that does not resolve to an NCBI
+    # taxon, falls back to automatic prediction with the reason recorded. The
+    # submitter is not present to correct it, so failing the job would just
+    # throw the work away.
+    #
+    # (The previous code assigned $1 unconditionally, which leaked whatever the
+    # last successful match in scope had captured whenever taxonomy_id was
+    # absent -- precisely the case prediction now has to handle.)
+    #
     my $user_id = $core->user_id;
+    my $api = P3DataAPI->new();
+
+    my $predictor = Bio::P3::GenomeAnnotationApp::SkaniPredictor->new();
+
+    #
+    # What to do if the supplied taxonomy_id disagrees with the prediction:
+    # "auto" uses the prediction, "supplied" keeps the submitted id. Checked
+    # up front so a bad value fails before any work is done.
+    #
+    my $mismatch_policy = $params->{organism_mismatch_policy};
+    my $on_mismatch = $predictor->resolve_mismatch_policy($mismatch_policy);
+
+    my $supplied_raw = $params->{taxonomy_id};
+    my($supplied_id, $supplied_name, $supplied_reason) =
+        $predictor->validate_supplied_taxon($api, $supplied_raw);
+
+    if (defined $supplied_reason)
+    {
+	print STDERR "[" . $predictor->status . "] $supplied_reason; " .
+	    "falling back to automatic organism prediction\n";
+	delete $params->{taxonomy_id};
+    }
+    else
+    {
+	$params->{taxonomy_id} = $supplied_id if defined $supplied_id;
+
+	#
+	# scientific_name is optional (CLI jobs may send only a taxonomy_id).
+	# Fill it from the taxon so downstream steps that key off the name --
+	# AMRFinder's organism flag, the Streptococcus workflow steps -- see
+	# the same organism as the id.
+	#
+	if (defined $supplied_id && !($params->{scientific_name} && $params->{scientific_name} =~ /\S/))
+	{
+	    $params->{scientific_name} = $supplied_name;
+	}
+    }
+
+    my $prediction_mode = defined $supplied_reason ? 'auto_fallback'
+                        : defined $supplied_id     ? 'supplied'
+                        :                            'auto';
+
+    #
+    # Stage the contigs once, here. Organism prediction needs them before the
+    # genome object can be created, and the annotation pipeline below reuses
+    # this same copy rather than downloading a second one.
+    #
+    my $ws = $app->workspace();
+    my($input_path) = $params->{contigs};
+
+    my $temp = File::Temp->new();
+    $ws->copy_files_to_handles(1, $core->token, [[$input_path, $temp]]);
+    close($temp);
+
+    #
+    # Organism prediction (IN DEVELOPMENT).
+    #
+    #   a. taxonomy_id supplied and consistent with the prediction -> confirm
+    #   b. taxonomy_id supplied and divergent                      -> organism_mismatch_policy
+    #   c. no usable taxonomy_id                                   -> use prediction
+    #
+    # Runs on every job, including those that supply a correct taxonomy_id,
+    # because cases (a) and (b) cannot exist otherwise. Cost is ~15s wall and
+    # ~1.6GB RSS per job, of which roughly 95% is container startup and the
+    # marker-index load; the comparison itself is ~0.5s.
+    #
+    # The prediction is reported at species or genus rank (see the tier rule in
+    # SkaniPredictor), never at the matched reference's strain.
+    #
+    # Any fatal outcome is held in $fatal until the organism report below has
+    # been written, so every job emits exactly one report line, including the
+    # ones that stop here.
+    #
+    my $prediction;
+    my($exact_match, $lineage_consistent, $action, $fatal);
+
+    if (!$predictor->enabled)
+    {
+	$action = 'prediction_unavailable';
+	print STDERR "Organism prediction unavailable (sketch database not found)\n";
+	if (!$params->{taxonomy_id})
+	{
+	    $fatal = "Cannot determine the organism for these contigs: no usable " .
+		"taxonomy_id was supplied and organism prediction is not configured " .
+		"on this deployment.\n";
+	}
+    }
+    else
+    {
+	$prediction = $predictor->predict("$temp", $api);
+
+	if ($prediction->{status} eq 'declined')
+	{
+	    if (!$params->{taxonomy_id})
+	    {
+		#
+		# Nothing to fall back to: prediction found no reference above the
+		# genus-level thresholds and no usable taxonomy_id was supplied.
+		#
+		$action = 'failed_unidentifiable';
+		my $c = $prediction->{closest};
+		$fatal = "[" . $predictor->status . "] Could not determine the organism " .
+		    "from these contigs: $prediction->{reason}. The assembly did not " .
+		    "match any genome in the BV-BRC reference set closely enough to " .
+		    "identify it, even at genus level." .
+		    ($c ? sprintf(" Closest reference: %s (%s), ANI %.2f%%, reference " .
+				  "alignment fraction %.1f%%.",
+				  $c->{reference_name}, $c->{genome_id}, $c->{ani}, $c->{af_ref})
+			: "") .
+		    " Resubmit with a taxonomy_id to annotate it anyway.\n";
+	    }
+	    else
+	    {
+		$action = 'declined_kept_supplied';
+		print STDERR "[" . $predictor->status . "] organism prediction declined " .
+		    "($prediction->{reason}); proceeding with taxonomy_id " .
+		    "$params->{taxonomy_id}\n";
+	    }
+	}
+	else
+	{
+	    #
+	    # Record BOTH notions of agreement. exact_match is the statistic for
+	    # the mismatch report; lineage consistency is what drives the action.
+	    #
+	    if (defined $params->{taxonomy_id})
+	    {
+		$exact_match = ($params->{taxonomy_id} eq $prediction->{taxon_id}) ? 1 : 0;
+		$lineage_consistent = $predictor->taxa_consistent(
+		    $api, $params->{taxonomy_id}, $prediction->{taxon_id});
+	    }
+
+	    if (!defined $params->{taxonomy_id})
+	    {
+		#
+		# Case (c). Taxon and name both come from the prediction, which
+		# resolved them from the same NCBI lineage, so they cannot disagree.
+		#
+		$action = "used_prediction_$prediction->{tier}";
+		$params->{taxonomy_id}     = $prediction->{taxon_id};
+		$params->{scientific_name} = $prediction->{scientific_name};
+
+		printf STDERR "[%s] organism predicted at %s level: %s (taxon %s) " .
+		    "from reference %s [%s], ANI %.2f%%, AF_ref %.1f%%%s\n",
+		    $predictor->status, $prediction->{tier},
+		    $params->{scientific_name}, $params->{taxonomy_id},
+		    $prediction->{genome_id}, $prediction->{reference_name},
+		    $prediction->{ani}, $prediction->{af_ref},
+		    ($prediction->{tier} eq 'genus' ? "; $prediction->{tier_reason}" : "");
+	    }
+	    elsif (!defined $lineage_consistent)
+	    {
+		$action = 'lineage_unresolved_kept_supplied';
+		print STDERR "[" . $predictor->status . "] could not resolve lineages to " .
+		    "compare supplied taxonomy_id $params->{taxonomy_id} against " .
+		    "predicted $prediction->{taxon_id}; proceeding with the supplied " .
+		    "value\n";
+	    }
+	    elsif ($lineage_consistent)
+	    {
+		#
+		# Case (a). A genus-level prediction is consistent with any supplied
+		# species inside that genus.
+		#
+		$action = 'confirmed';
+		printf STDERR "[%s] supplied taxonomy_id %s is consistent with the " .
+		    "predicted organism %s (%s level, ANI %.2f%%, exact id match: %s)\n",
+		    $predictor->status, $params->{taxonomy_id},
+		    $prediction->{scientific_name}, $prediction->{tier}, $prediction->{ani},
+		    ($exact_match ? "yes" : "no");
+	    }
+	    else
+	    {
+		#
+		# Case (b).
+		#
+		$action = "mismatch_$on_mismatch";
+		my($use_id, $use_name) = eval {
+		    $predictor->handle_mismatch(
+			supplied_taxon_id => $params->{taxonomy_id},
+			supplied_name     => $supplied_name,
+			prediction        => $prediction,
+			on_mismatch       => $on_mismatch);
+		};
+		if ($@)
+		{
+		    $fatal = $@;
+		}
+		else
+		{
+		    #
+		    # Taxon and name move together, or not at all.
+		    #
+		    $params->{taxonomy_id}     = $use_id;
+		    $params->{scientific_name} = $use_name if defined $use_name;
+		}
+	    }
+	}
+    }
+
+    #
+    # One structured line per job, for the mismatch report. Greppable on
+    # [ORGANISM_PREDICTION] and parseable as JSON.
+    #
+    my $organism_report = $predictor->build_report(
+	mode               => $prediction_mode,
+	supplied_taxon     => $supplied_raw,
+	supplied_name      => $supplied_name,
+	supplied_reason    => $supplied_reason,
+	prediction         => $prediction,
+	exact_match        => $exact_match,
+	lineage_consistent => $lineage_consistent,
+	mismatch_policy    => $mismatch_policy,
+	on_mismatch        => $on_mismatch,
+	final_taxon       => ($fatal ? undef : $params->{taxonomy_id}),
+	final_name         => ($fatal ? undef : $params->{scientific_name}),
+	action             => $action);
+    $predictor->emit_report($organism_report);
+    $params->{_organism_prediction} = $organism_report;
+
+    die $fatal if $fatal;
 
     #
     # If we are missing domain and/or genetic code, look up from taxonomy.
     #
-    my $api = P3DataAPI->new();
     my $def = $api->get_taxon_metadata($params->{taxonomy_id});
 
     print Dumper($params);
@@ -138,12 +365,9 @@ sub process_genome
     my $genome = $core->impl->create_genome($meta);
 
     #
-    # Determine workspace paths for our input and output
+    # Determine workspace paths for our input and output.
+    # $ws and $input_path were established above, with the contig download.
     #
-
-    my $ws = $app->workspace();
-
-    my($input_path) = $params->{contigs};
 
     my $output_folder = $app->result_folder();
 
@@ -155,14 +379,10 @@ sub process_genome
     }
 
     #
-    # Read contig data
+    # Read contig data. The file was downloaded once, above, so that organism
+    # prediction could run before the genome object was created.
     #
 
-    my $temp = File::Temp->new();
-
-    $ws->copy_files_to_handles(1, $core->token, [[$input_path, $temp]]);
-    
-    close($temp);
     my $contig_data_fh = open_contigs("$temp");
 
 
