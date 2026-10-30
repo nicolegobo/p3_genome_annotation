@@ -372,6 +372,117 @@
     },
     {
       "default": null,
+      "desc": "The submitter's label for the genome. Used only when no taxonomy_id is given: the genome is named '<predicted organism> <my_label>'.",
+      "id": "my_label",
+      "label": "My label",
+      "required": 0,
+      "type": "string"
+    },
+    {
+      "default": null,
+      "desc": "Record of a Similar Genome Finder (MinHash) search run from the submission form, for organism-prediction reporting. Not used to choose the organism; taxonomy_id carries the submitter's choice.",
+      "group": [
+        {
+          "desc": "Workspace file searched (contigs, or read 1 of a pair)",
+          "id": "input_file",
+          "required": 0,
+          "type": "string"
+        },
+        {
+          "id": "include_bacterial",
+          "required": 0,
+          "type": "bool"
+        },
+        {
+          "id": "include_viral",
+          "required": 0,
+          "type": "bool"
+        },
+        {
+          "id": "max_hits",
+          "required": 0,
+          "type": "int"
+        },
+        {
+          "id": "max_distance",
+          "required": 0,
+          "type": "float"
+        },
+        {
+          "id": "max_pvalue",
+          "required": 0,
+          "type": "float"
+        },
+        {
+          "desc": "Reference genome the submitter selected from the results, if any",
+          "id": "selected_genome_id",
+          "required": 0,
+          "type": "string"
+        },
+        {
+          "desc": "Species taxon filled in from the chosen genome, if any",
+          "id": "selected_taxon_id",
+          "required": 0,
+          "type": "string"
+        },
+        {
+          "allow_multiple": true,
+          "desc": "Every hit shown, best first",
+          "group": [
+            {
+              "id": "genome_id",
+              "required": 0,
+              "type": "string"
+            },
+            {
+              "id": "genome_name",
+              "required": 0,
+              "type": "string"
+            },
+            {
+              "id": "species_taxon_id",
+              "required": 0,
+              "type": "string"
+            },
+            {
+              "id": "species_name",
+              "required": 0,
+              "type": "string"
+            },
+            {
+              "id": "distance",
+              "required": 0,
+              "type": "float"
+            },
+            {
+              "id": "pvalue",
+              "required": 0,
+              "type": "float"
+            },
+            {
+              "id": "kmer_counts",
+              "required": 0,
+              "type": "string"
+            },
+            {
+              "desc": "(1 - distance) * 100",
+              "id": "est_ani",
+              "required": 0,
+              "type": "float"
+            }
+          ],
+          "id": "hits",
+          "required": 0,
+          "type": "group"
+        }
+      ],
+      "id": "similar_genome_finder",
+      "label": "Similar Genome Finder results",
+      "required": 0,
+      "type": "group"
+    },
+    {
+      "default": null,
       "desc": "Reference genome ID",
       "id": "reference_genome_id",
       "label": "Reference genome ID",

@@ -127,7 +127,29 @@ sub process_genome
     my($supplied_id, $supplied_name, $supplied_reason) =
         $predictor->validate_supplied_taxon($api, $supplied_raw);
 
-    if (defined $supplied_reason)
+    if (defined $supplied_reason && $on_mismatch eq 'warn_use_supplied')
+    {
+	#
+	# The submitter asked us to keep their taxon, so substituting a predicted
+	# one would override that choice. Stop here, before the contigs are
+	# downloaded, with the report line written first.
+	#
+	my $fatal = "[" . $predictor->status . "] The job was stopped because the " .
+	    "$supplied_reason. organism_mismatch_policy is 'supplied', so a predicted " .
+	    "organism will not be substituted. Resubmit with a valid NCBI taxonomy_id, " .
+	    "or set organism_mismatch_policy to 'auto' to use the predicted organism.\n";
+	$predictor->emit_report($predictor->build_report(
+	    mode            => 'supplied_invalid',
+	    minhash         => scalar(eval { $predictor->summarize_minhash(
+				   $api, $params->{similar_genome_finder}) }),
+	    supplied_taxon  => $supplied_raw,
+	    supplied_reason => $supplied_reason,
+	    mismatch_policy => $mismatch_policy,
+	    on_mismatch     => $on_mismatch,
+	    action          => 'failed_invalid_supplied_taxon'));
+	die $fatal;
+    }
+    elsif (defined $supplied_reason)
     {
 	print STDERR "[" . $predictor->status . "] $supplied_reason; " .
 	    "falling back to automatic organism prediction\n";
@@ -185,7 +207,7 @@ sub process_genome
     # ones that stop here.
     #
     my $prediction;
-    my($exact_match, $lineage_consistent, $action, $fatal);
+    my($exact_match, $lineage_consistent, $action, $fatal, $taxon_overridden);
 
     if (!$predictor->enabled)
     {
@@ -248,10 +270,14 @@ sub process_genome
 		#
 		# Case (c). Taxon and name both come from the prediction, which
 		# resolved them from the same NCBI lineage, so they cannot disagree.
+		# The submitter's label follows the organism, as the website does
+		# when a taxonomy is chosen.
 		#
 		$action = "used_prediction_$prediction->{tier}";
 		$params->{taxonomy_id}     = $prediction->{taxon_id};
 		$params->{scientific_name} = $prediction->{scientific_name};
+		$params->{scientific_name} .= " $1"
+		    if defined $params->{my_label} && $params->{my_label} =~ /^\s*(\S.*?)\s*$/;
 
 		printf STDERR "[%s] organism predicted at %s level: %s (taxon %s) " .
 		    "from reference %s [%s], ANI %.2f%%, AF_ref %.1f%%%s\n",
@@ -302,10 +328,13 @@ sub process_genome
 		else
 		{
 		    #
-		    # Taxon and name move together, or not at all.
+		    # Taxon and name move together, or not at all. The submitter's
+		    # label (the part of the name after the organism) is kept.
 		    #
+		    $taxon_overridden = 1 if $use_id ne $params->{taxonomy_id};
 		    $params->{taxonomy_id}     = $use_id;
-		    $params->{scientific_name} = $use_name if defined $use_name;
+		    $params->{scientific_name} = $predictor->replace_organism_name(
+			$params->{scientific_name}, $supplied_name, $use_name) if defined $use_name;
 		}
 	    }
 	}
@@ -315,8 +344,14 @@ sub process_genome
     # One structured line per job, for the mismatch report. Greppable on
     # [ORGANISM_PREDICTION] and parseable as JSON.
     #
+    my $minhash = eval {
+	$predictor->summarize_minhash($api, $params->{similar_genome_finder}, $supplied_id, $prediction);
+    };
+    print STDERR "[" . $predictor->status . "] could not summarize similar_genome_finder: $@" if $@;
+
     my $organism_report = $predictor->build_report(
 	mode               => $prediction_mode,
+	minhash            => $minhash,
 	supplied_taxon     => $supplied_raw,
 	supplied_name      => $supplied_name,
 	supplied_reason    => $supplied_reason,
@@ -335,11 +370,14 @@ sub process_genome
 
     #
     # If we are missing domain and/or genetic code, look up from taxonomy.
+    # When the prediction replaced the supplied taxon, any submitted domain
+    # and code belonged to the replaced organism, so look them up regardless.
     #
     my $def = $api->get_taxon_metadata($params->{taxonomy_id});
 
     print Dumper($params);
-    if (!$params->{domain} ||
+    if ($taxon_overridden ||
+	!$params->{domain} ||
 	$params->{domain} eq 'auto' ||
 	!$params->{code})
     {

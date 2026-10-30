@@ -582,7 +582,8 @@ sub assign_tier
 #
 # Returns:
 #   { status => 'ok', tier => 'species'|'genus', taxon_id, scientific_name,
-#     rank, genome_id, reference_name, reference_taxon_id, ani, af_ref,
+#     rank, genome_id, reference_name, reference_taxon_id,
+#     top_species_id, top_species_name, ani, af_ref,
 #     af_query, ani_ci_low, ani_ci_high, demoted, ci_overlap, next_species,
 #     tier_reason, n_hits }
 #   { status => 'declined', reason, n_hits, closest }
@@ -677,6 +678,8 @@ sub predict
         genome_id          => $top->{_genome_id},
         reference_name     => $top->{_reference_name},
         reference_taxon_id => $top->{_taxon_id},
+        top_species_id     => $top->{_species_id},
+        top_species_name   => $top->{_species_name},
         ani                => $top->{ANI},
         af_ref             => $top->{Align_fraction_ref},
         af_query           => $top->{Align_fraction_query},
@@ -799,6 +802,8 @@ sub build_report
         $r{reference_genome}   = $pred->{genome_id};
         $r{reference_name}     = $pred->{reference_name};
         $r{reference_taxon}    = $pred->{reference_taxon_id};
+        $r{top_species_id}     = $pred->{top_species_id};      # best hit's species, even when
+        $r{top_species_name}   = $pred->{top_species_name};    # the call was demoted to genus
         $r{ani}                = $pred->{ani};
         $r{af_ref}             = $pred->{af_ref};
         $r{af_query}           = $pred->{af_query};
@@ -839,12 +844,85 @@ sub build_report
     $r{final_taxon} = $a{final_taxon};
     $r{final_name}  = $a{final_name};
 
+    if (my $m = $a{minhash})
+    {
+        @r{keys %$m} = values %$m;
+    }
+
     $r{exact_match}        = $a{exact_match};
     $r{lineage_consistent} = $a{lineage_consistent};
     $r{mismatch_policy}    = $a{mismatch_policy};    # auto | supplied | undef (default)
     $r{on_mismatch}        = $a{on_mismatch} // $ON_MISMATCH;
     $r{action}             = $a{action};
 
+    return \%r;
+}
+
+#
+# Summarize a Similar Genome Finder (MinHash) search recorded by the submission
+# form, and compare its top species with skani's, for the per-job report.
+#
+# The record comes from the browser, so it is reported, never trusted: it does
+# not influence which organism the job uses. Returns undef when no search was
+# run.
+#
+# Keys (all prefixed minhash_ so they cannot collide with skani's):
+#   minhash_hits            every hit shown, best first, as submitted
+#   minhash_top_*           the best hit
+#   minhash_selected_*      the result row the submitter selected, if any
+#   minhash_taxon_source    'similar_genome_finder' if the submitted
+#                           taxonomy_id is the one filled in from the finder,
+#                           'manual' if the submitter changed it afterwards
+#   minhash_skani_species_match       top MinHash species == skani's best-hit
+#                                     species (1/0, undef if either is missing)
+#   minhash_skani_lineage_consistent  top MinHash species is consistent with
+#                                     skani's call (see taxa_consistent)
+#
+sub summarize_minhash
+{
+    my($self, $api, $sgf, $supplied_id, $prediction) = @_;
+
+    return undef unless ref $sgf eq 'HASH';
+
+    my @hits = grep { ref $_ eq 'HASH' } (ref $sgf->{hits} eq 'ARRAY' ? @{$sgf->{hits}} : ());
+    my %fields = map { $_ => 1 } qw(genome_id genome_name species_taxon_id species_name
+                                    distance pvalue kmer_counts est_ani);
+    @hits = map { my $h = $_; +{ map { $_ => $h->{$_} } grep { $fields{$_} } keys %$h } } @hits;
+
+    my %r = (
+        minhash_ran               => 1,
+        minhash_input_file        => $sgf->{input_file},
+        minhash_include_bacterial => $sgf->{include_bacterial},
+        minhash_include_viral     => $sgf->{include_viral},
+        minhash_max_hits          => $sgf->{max_hits},
+        minhash_n_hits            => scalar(@hits),
+        minhash_hits              => \@hits,
+        minhash_selected_genome   => $sgf->{selected_genome_id},
+        minhash_selected_taxon    => $sgf->{selected_taxon_id},
+    );
+
+    if (defined $sgf->{selected_taxon_id} && defined $supplied_id)
+    {
+        $r{minhash_taxon_source} = $sgf->{selected_taxon_id} eq $supplied_id
+            ? 'similar_genome_finder' : 'manual';
+    }
+
+    my $top = $hits[0] or return \%r;
+    $r{minhash_top_genome}       = $top->{genome_id};
+    $r{minhash_top_species_id}   = $top->{species_taxon_id};
+    $r{minhash_top_species_name} = $top->{species_name};
+    $r{minhash_top_distance}     = $top->{distance};
+    $r{minhash_top_est_ani}      = $top->{est_ani};
+    $r{minhash_top_kmer_counts}  = $top->{kmer_counts};
+
+    if ($prediction && $prediction->{status} eq 'ok' && defined $top->{species_taxon_id})
+    {
+        $r{minhash_skani_species_match} = defined $prediction->{top_species_id}
+            ? ($top->{species_taxon_id} eq $prediction->{top_species_id} ? 1 : 0)
+            : undef;
+        $r{minhash_skani_lineage_consistent} =
+            $self->taxa_consistent($api, $top->{species_taxon_id}, $prediction->{taxon_id});
+    }
     return \%r;
 }
 
@@ -873,11 +951,30 @@ sub emit_report
 # ---------------------------------------------------------------------------
 #
 
-sub _fmt_prediction
+#
+# Swap the organism part of a submitted genome name, keeping the submitter's
+# label.
+#
+# The website builds scientific_name as "<taxon name> <My Label>", with
+# ( ) | / : stripped from the taxon name. When that prefix is found, the
+# label after it is kept: "Escherichia coli isolate-42" becomes
+# "Klebsiella pneumoniae isolate-42". Any strain text in the supplied
+# taxon name is dropped with it, since the prediction never names a strain.
+# A name without that prefix (e.g. a CLI submission) is replaced whole.
+#
+sub replace_organism_name
 {
-    my($p) = @_;
-    return sprintf("%-10s %s   ANI %.2f%%, AF %.1f%%",
-                   $p->{taxon_id}, $p->{scientific_name}, $p->{ani}, $p->{af_query});
+    my($self, $name, $supplied_taxon_name, $new_organism) = @_;
+
+    return $new_organism unless defined $name && $name =~ /\S/ && defined $supplied_taxon_name;
+
+    (my $cleaned = $supplied_taxon_name) =~ s/[()|\/:]//g;
+    for my $prefix ($cleaned, $supplied_taxon_name)
+    {
+        next unless $prefix =~ /\S/;
+        return $new_organism . ($1 // '') if $name =~ /^\s*\Q$prefix\E(\s+\S.*)?$/;
+    }
+    return $new_organism;
 }
 
 #

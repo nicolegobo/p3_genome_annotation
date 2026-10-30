@@ -335,7 +335,7 @@ sub process_contigs
 
     my $params = $self->params;
     my @keys = qw(contigs scientific_name taxonomy_id code domain workflow analyze_quality skip_indexing
-		  organism_mismatch_policy);
+		  organism_mismatch_policy similar_genome_finder my_label);
 
     my $annotation_input = { map { exists $params->{$_} ? ($_, $params->{$_}) : () } @keys };
 
